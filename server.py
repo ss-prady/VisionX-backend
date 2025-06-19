@@ -17,82 +17,6 @@ from urllib.parse import urlparse
 from functools import wraps
 import time
 
-app = Flask(__name__)
-
-# Configure comprehensive logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]',
-    handlers=[
-        logging.FileHandler('app.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# Enable CORS for all routes - this is crucial for Chrome extension communication
-CORS(app, supports_credentials=True)
-
-# Secret key for JWT tokens - in production, use environment variable
-SECRET_KEY = os.environ.get('SECRET_KEY', secrets.token_hex(32))
-app.config['SECRET_KEY'] = SECRET_KEY
-
-# Database connection pool
-db_pool = None
-db_lock = threading.Lock()
-
-# Custom exceptions for better error handling
-class DatabaseError(Exception):
-    """Custom exception for database-related errors"""
-    pass
-
-class ValidationError(Exception):
-    """Custom exception for input validation errors"""
-    pass
-
-class AuthenticationError(Exception):
-    """Custom exception for authentication-related errors"""
-    pass
-
-def validate_email(email):
-    """Enhanced email validation"""
-    if not email or len(email) > 255:
-        return False
-    
-    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    return re.match(email_pattern, email) is not None
-
-def validate_username(username):
-    """Enhanced username validation"""
-    if not username or len(username) < 3 or len(username) > 50:
-        return False
-    
-    # Allow only alphanumeric characters and underscores
-    username_pattern = r'^[a-zA-Z0-9_]+$'
-    return re.match(username_pattern, username) is not None
-
-def validate_password(password):
-    """Enhanced password validation"""
-    if not password or len(password) < 8:
-        return False
-    
-    # Check for at least one uppercase, one lowercase, one digit
-    if not re.search(r'[A-Z]', password):
-        return False
-    if not re.search(r'[a-z]', password):
-        return False
-    if not re.search(r'\d', password):
-        return False
-    
-    return True
-
-def sanitize_input(data):
-    """Sanitize input data to prevent XSS and injection attacks"""
-    if isinstance(data, str):
-        # Remove any potentially dangerous characters
-        return data.strip()[:500]  # Limit length
-    return data
-
 def init_database_pool():
     """Initialize PostgreSQL connection pool using psycopg3 with enhanced error handling"""
     global db_pool
@@ -172,6 +96,94 @@ def init_database():
         except (psycopg.Error, PoolTimeout) as e:
             logger.error(f"Error initializing database: {e}")
             raise DatabaseError(f"Database initialization failed: {e}")
+
+# Configure comprehensive logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]',
+    handlers=[
+        logging.FileHandler('app.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+try:
+    logger.info("Initializing database connection pool...")
+    init_database_pool()
+    
+    logger.info("Initializing database tables...")
+    init_database()
+    
+    logger.info("Database initialization completed successfully")
+except Exception as e:
+    logger.critical(f"Failed to initialize database: {e}")
+    raise
+
+app = Flask(__name__)
+
+# Enable CORS for all routes - this is crucial for Chrome extension communication
+CORS(app, supports_credentials=True)
+
+# Secret key for JWT tokens - in production, use environment variable
+SECRET_KEY = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+app.config['SECRET_KEY'] = SECRET_KEY
+
+# Database connection pool
+db_pool = None
+db_lock = threading.Lock()
+
+# Custom exceptions for better error handling
+class DatabaseError(Exception):
+    """Custom exception for database-related errors"""
+    pass
+
+class ValidationError(Exception):
+    """Custom exception for input validation errors"""
+    pass
+
+class AuthenticationError(Exception):
+    """Custom exception for authentication-related errors"""
+    pass
+
+def validate_email(email):
+    """Enhanced email validation"""
+    if not email or len(email) > 255:
+        return False
+    
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return re.match(email_pattern, email) is not None
+
+def validate_username(username):
+    """Enhanced username validation"""
+    if not username or len(username) < 3 or len(username) > 50:
+        return False
+    
+    # Allow only alphanumeric characters and underscores
+    username_pattern = r'^[a-zA-Z0-9_]+$'
+    return re.match(username_pattern, username) is not None
+
+def validate_password(password):
+    """Enhanced password validation"""
+    if not password or len(password) < 8:
+        return False
+    
+    # Check for at least one uppercase, one lowercase, one digit
+    if not re.search(r'[A-Z]', password):
+        return False
+    if not re.search(r'[a-z]', password):
+        return False
+    if not re.search(r'\d', password):
+        return False
+    
+    return True
+
+def sanitize_input(data):
+    """Sanitize input data to prevent XSS and injection attacks"""
+    if isinstance(data, str):
+        # Remove any potentially dangerous characters
+        return data.strip()[:500]  # Limit length
+    return data
 
 def hash_password(password):
     """Hash a password using bcrypt with enhanced security"""
@@ -555,14 +567,6 @@ def root():
 
 if __name__ == '__main__':
     try:
-        # Initialize database connection pool
-        logger.info("Initializing database connection pool...")
-        init_database_pool()
-
-        # Initialize database tables
-        logger.info("Initializing database tables...")
-        init_database()
-
         # Get port from environment variable (Render.com sets this)
         port = int(os.environ.get('PORT', 5000))
 
