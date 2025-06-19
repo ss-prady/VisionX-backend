@@ -565,6 +565,65 @@ def root():
         }
     }), 200
 
+@app.route('/api/user/delete', methods=['DELETE'])
+@require_auth
+def delete_account():
+    """Delete user account (protected route)"""
+    try:
+        username = request.current_user
+
+        # First verify the user's password for security
+        if not request.is_json:
+            raise ValidationError('Request must contain JSON data')
+            
+        data = request.get_json()
+        if not data or 'password' not in data:
+            raise ValidationError('Password confirmation is required')
+
+        password = data['password']
+
+        # Database operation to verify password
+        def verify_and_delete(cursor):
+            # Get user's password hash
+            cursor.execute(
+                'SELECT password_hash FROM users WHERE username = %s',
+                (username,)
+            )
+            user = cursor.fetchone()
+            
+            if not user:
+                raise AuthenticationError('User not found')
+                
+            if not verify_password(password, user[0]):
+                raise AuthenticationError('Invalid password')
+                
+            # Delete the user account
+            cursor.execute(
+                'DELETE FROM users WHERE username = %s',
+                (username,)
+            )
+            return True
+
+        handle_database_operation(verify_and_delete)
+
+        logger.info(f"Account deleted successfully: {username}")
+        return jsonify({
+            'message': 'Account deleted successfully',
+            'username': username
+        }), 200
+
+    except (ValidationError, AuthenticationError) as e:
+        logger.warning(f"Account deletion failed for {username}: {str(e)}")
+        return jsonify({'error': str(e)}), 401
+        
+    except DatabaseError as e:
+        logger.error(f"Database error during account deletion for {username}: {str(e)}")
+        return jsonify({'error': 'Account deletion failed'}), 500
+        
+    except Exception as e:
+        logger.error(f"Unexpected error during account deletion for {username}: {str(e)}")
+        return jsonify({'error': 'Account deletion failed due to unexpected error'}), 500
+
 if __name__ == '__main__':
     try:
         # Get port from environment variable (Render.com sets this)
