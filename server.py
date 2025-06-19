@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import psycopg2
-from psycopg2 import pool
+import psycopg
+from psycopg_pool import ConnectionPool
 import bcrypt
 import jwt
 import threading
@@ -24,7 +24,7 @@ db_pool = None
 db_lock = threading.Lock()
 
 def init_database_pool():
-    """Initialize PostgreSQL connection pool"""
+    """Initialize PostgreSQL connection pool using psycopg3"""
     global db_pool
 
     # Get database URL from environment variable
@@ -37,68 +37,45 @@ def init_database_pool():
     if database_url.startswith('postgres://'):
         database_url = database_url.replace('postgres://', 'postgresql://', 1)
 
-    # Parse URL components
-    url = urlparse(database_url)
-
     try:
-        # Create connection pool
-        db_pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=1,
-            maxconn=20,
-            host=url.hostname,
-            port=url.port or 5432,
-            database=url.path[1:],  # Remove leading slash
-            user=url.username,
-            password=url.password,
-            sslmode='require'  # Required for most cloud PostgreSQL services
+        # Create connection pool using psycopg3
+        db_pool = ConnectionPool(
+            conninfo=database_url,
+            min_size=1,
+            max_size=20,
+            open=True  # Open pool immediately
         )
+
+        # Wait for pool to be ready
+        db_pool.wait(timeout=30)
         print("Database connection pool created successfully")
-    except psycopg2.Error as e:
+    except psycopg.Error as e:
         print(f"Error creating database connection pool: {e}")
         raise
-
-def get_db_connection():
-    """Get a connection from the pool"""
-    if db_pool is None:
-        raise ValueError("Database pool not initialized")
-    return db_pool.getconn()
-
-def return_db_connection(conn):
-    """Return a connection to the pool"""
-    if db_pool is not None:
-        db_pool.putconn(conn)
 
 def init_database():
     """Initialize the PostgreSQL database with users table"""
     with db_lock:
-        conn = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
+        with db_pool.connection() as conn:
+            with conn.cursor() as cursor:
+                try:
+                    # Create users table if it doesn't exist (PostgreSQL syntax)
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS users (
+                            id SERIAL PRIMARY KEY,
+                            username VARCHAR(255) UNIQUE NOT NULL,
+                            password_hash TEXT NOT NULL,
+                            email VARCHAR(255) UNIQUE NOT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
 
-            # Create users table if it doesn't exist (PostgreSQL syntax)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    username VARCHAR(255) UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    email VARCHAR(255) UNIQUE NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+                    # Connection automatically commits when context exits successfully
+                    print("Database table created successfully")
 
-            conn.commit()
-            print("Database table created successfully")
-
-        except psycopg2.Error as e:
-            print(f"Error initializing database: {e}")
-            if conn:
-                conn.rollback()
-            raise
-        finally:
-            if conn:
-                cursor.close()
-                return_db_connection(conn)
+                except psycopg.Error as e:
+                    print(f"Error initializing database: {e}")
+                    raise
 
 def hash_password(password):
     """Hash a password using bcrypt"""
@@ -131,7 +108,6 @@ def verify_jwt_token(token):
 @app.route('/api/register', methods=['POST'])
 def register():
     """Register a new user"""
-    conn = None
     try:
         data = request.get_json()
 
@@ -155,42 +131,34 @@ def register():
 
         # Insert user into database
         with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
+            with db_pool.connection() as conn:
+                with conn.cursor() as cursor:
+                    try:
+                        cursor.execute(
+                            'INSERT INTO users (username, password_hash, email) VALUES (%s, %s, %s)',
+                            (username, password_hash, email)
+                        )
 
-            try:
-                cursor.execute(
-                    'INSERT INTO users (username, password_hash, email) VALUES (%s, %s, %s)',
-                    (username, password_hash, email)
-                )
-                conn.commit()
+                        # Generate JWT token
+                        token = generate_jwt_token(username)
 
-                # Generate JWT token
-                token = generate_jwt_token(username)
+                        return jsonify({
+                            'message': 'User registered successfully',
+                            'token': token,
+                            'username': username
+                        }), 201
 
-                return jsonify({
-                    'message': 'User registered successfully',
-                    'token': token,
-                    'username': username
-                }), 201
-
-            except psycopg2.IntegrityError:
-                conn.rollback()
-                return jsonify({'error': 'Username or email already exists'}), 400
-            finally:
-                cursor.close()
-                return_db_connection(conn)
+                    except psycopg.IntegrityError:
+                        # Connection automatically rolls back on exception
+                        return jsonify({'error': 'Username or email already exists'}), 400
 
     except Exception as e:
-        if conn:
-            conn.rollback()
         print(f"Registration error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/api/login', methods=['POST'])
 def login():
     """Login a user"""
-    conn = None
     try:
         data = request.get_json()
 
@@ -202,16 +170,13 @@ def login():
 
         # Get user from database
         with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-
-            cursor.execute(
-                'SELECT username, password_hash FROM users WHERE username = %s',
-                (username,)
-            )
-            user = cursor.fetchone()
-            cursor.close()
-            return_db_connection(conn)
+            with db_pool.connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        'SELECT username, password_hash FROM users WHERE username = %s',
+                        (username,)
+                    )
+                    user = cursor.fetchone()
 
         if user and verify_password(password, user[1]):
             # Generate JWT token
@@ -256,7 +221,6 @@ def verify_token():
 @app.route('/api/user/profile', methods=['GET'])
 def get_profile():
     """Get user profile (protected route)"""
-    conn = None
     try:
         auth_header = request.headers.get('Authorization')
         if not auth_header or not auth_header.startswith('Bearer '):
@@ -270,16 +234,13 @@ def get_profile():
 
         # Get user profile from database
         with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-
-            cursor.execute(
-                'SELECT username, email, created_at FROM users WHERE username = %s',
-                (username,)
-            )
-            user = cursor.fetchone()
-            cursor.close()
-            return_db_connection(conn)
+            with db_pool.connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        'SELECT username, email, created_at FROM users WHERE username = %s',
+                        (username,)
+                    )
+                    user = cursor.fetchone()
 
         if user:
             return jsonify({
