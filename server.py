@@ -17,6 +17,19 @@ from urllib.parse import urlparse
 from functools import wraps
 import time
 
+app = Flask(__name__)
+
+# Enable CORS for all routes - this is crucial for Chrome extension communication
+CORS(app, supports_credentials=True)
+
+# Secret key for JWT tokens - in production, use environment variable
+SECRET_KEY = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+app.config['SECRET_KEY'] = SECRET_KEY
+
+# Database connection pool
+db_pool = None
+db_lock = threading.Lock()
+
 def init_database_pool():
     """Initialize PostgreSQL connection pool using psycopg3 with enhanced error handling"""
     global db_pool
@@ -119,19 +132,6 @@ try:
 except Exception as e:
     logger.critical(f"Failed to initialize database: {e}")
     raise
-
-app = Flask(__name__)
-
-# Enable CORS for all routes - this is crucial for Chrome extension communication
-CORS(app, supports_credentials=True)
-
-# Secret key for JWT tokens - in production, use environment variable
-SECRET_KEY = os.environ.get('SECRET_KEY', secrets.token_hex(32))
-app.config['SECRET_KEY'] = SECRET_KEY
-
-# Database connection pool
-db_pool = None
-db_lock = threading.Lock()
 
 # Custom exceptions for better error handling
 class DatabaseError(Exception):
