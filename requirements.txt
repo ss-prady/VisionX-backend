@@ -1,15 +1,45 @@
-# Flask and web framework dependencies
+# Requirements for Enhanced Flask Chrome Extension Backend API
+# This file includes all dependencies with specific versions for production stability
+
+# Core Flask Framework
 Flask
+Werkzeug
+
+# CORS Support for Chrome Extension
 Flask-CORS
 
-# PostgreSQL database adapter (psycopg3)
+# PostgreSQL Database Adapter (psycopg3 with connection pooling)
 psycopg[binary,pool]
 
-# Authentication and security
+# Password Hashing
 bcrypt
+
+# JWT Token Handling
 PyJWT
 
-# Environment variables (for local development)
-python-dotenv
+# Additional Security Dependencies (Recommended)
+cryptography  # Required by PyJWT for certain algorithms
+
+# Development and Testing (Optional)
+pytest
+pytest-flask
+pytest-cov
+
+# Production Server (Recommended)
 gunicorn
 
+# Environment Variable Management (Optional)
+python-dotenv
+
+# Rate Limiting (Recommended for production)
+Flask-Limiter
+
+# Security Headers (Recommended for production)
+flask-talisman
+
+# Input Validation (Optional enhancement)
+wtforms
+email-validator
+
+# Monitoring and Logging (Optional)
+structlog
