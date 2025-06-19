@@ -1,14 +1,15 @@
 # Flask and web framework dependencies
-Flask==3.0.0
-Flask-CORS==4.0.0
+Flask
+Flask-CORS
 
 # PostgreSQL database adapter (psycopg3)
-psycopg[binary,pool]==3.2.9
+psycopg[binary,pool]
 
 # Authentication and security
-bcrypt==4.1.2
-PyJWT==2.8.0
+bcrypt
+PyJWT
 
 # Environment variables (for local development)
-python-dotenv==1.0.0
+python-dotenv
+gunicorn
 
