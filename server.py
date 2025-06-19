@@ -1,44 +1,104 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import sqlite3
+import psycopg2
+from psycopg2 import pool
 import bcrypt
 import jwt
 import threading
 import os
 from datetime import datetime, timedelta
 import secrets
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 
 # Enable CORS for all routes - this is crucial for Chrome extension communication
-CORS(app, origins=["chrome-extension://*"], supports_credentials=True)
+CORS(app, supports_credentials=True)
 
 # Secret key for JWT tokens - in production, use environment variable
 SECRET_KEY = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 app.config['SECRET_KEY'] = SECRET_KEY
 
-# Database lock for thread safety
+# Database connection pool
+db_pool = None
 db_lock = threading.Lock()
 
+def init_database_pool():
+    """Initialize PostgreSQL connection pool"""
+    global db_pool
+
+    # Get database URL from environment variable
+    database_url = os.environ.get('DATABASE_URL')
+
+    if not database_url:
+        raise ValueError("DATABASE_URL environment variable is required")
+
+    # Parse the database URL to handle different formats
+    if database_url.startswith('postgres://'):
+        database_url = database_url.replace('postgres://', 'postgresql://', 1)
+
+    # Parse URL components
+    url = urlparse(database_url)
+
+    try:
+        # Create connection pool
+        db_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=1,
+            maxconn=20,
+            host=url.hostname,
+            port=url.port or 5432,
+            database=url.path[1:],  # Remove leading slash
+            user=url.username,
+            password=url.password,
+            sslmode='require'  # Required for most cloud PostgreSQL services
+        )
+        print("Database connection pool created successfully")
+    except psycopg2.Error as e:
+        print(f"Error creating database connection pool: {e}")
+        raise
+
+def get_db_connection():
+    """Get a connection from the pool"""
+    if db_pool is None:
+        raise ValueError("Database pool not initialized")
+    return db_pool.getconn()
+
+def return_db_connection(conn):
+    """Return a connection to the pool"""
+    if db_pool is not None:
+        db_pool.putconn(conn)
+
 def init_database():
-    """Initialize the SQLite database with users table"""
+    """Initialize the PostgreSQL database with users table"""
     with db_lock:
-        conn = sqlite3.connect('users.db')
-        cursor = conn.cursor()
+        conn = None
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
 
-        # Create users table if it doesn't exist
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+            # Create users table if it doesn't exist (PostgreSQL syntax)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    username VARCHAR(255) UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    email VARCHAR(255) UNIQUE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+            print("Database table created successfully")
+
+        except psycopg2.Error as e:
+            print(f"Error initializing database: {e}")
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                cursor.close()
+                return_db_connection(conn)
 
 def hash_password(password):
     """Hash a password using bcrypt"""
@@ -71,6 +131,7 @@ def verify_jwt_token(token):
 @app.route('/api/register', methods=['POST'])
 def register():
     """Register a new user"""
+    conn = None
     try:
         data = request.get_json()
 
@@ -94,12 +155,12 @@ def register():
 
         # Insert user into database
         with db_lock:
-            conn = sqlite3.connect('users.db')
+            conn = get_db_connection()
             cursor = conn.cursor()
 
             try:
                 cursor.execute(
-                    'INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)',
+                    'INSERT INTO users (username, password_hash, email) VALUES (%s, %s, %s)',
                     (username, password_hash, email)
                 )
                 conn.commit()
@@ -113,17 +174,23 @@ def register():
                     'username': username
                 }), 201
 
-            except sqlite3.IntegrityError:
+            except psycopg2.IntegrityError:
+                conn.rollback()
                 return jsonify({'error': 'Username or email already exists'}), 400
             finally:
-                conn.close()
+                cursor.close()
+                return_db_connection(conn)
 
     except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"Registration error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/api/login', methods=['POST'])
 def login():
     """Login a user"""
+    conn = None
     try:
         data = request.get_json()
 
@@ -135,15 +202,16 @@ def login():
 
         # Get user from database
         with db_lock:
-            conn = sqlite3.connect('users.db')
+            conn = get_db_connection()
             cursor = conn.cursor()
 
             cursor.execute(
-                'SELECT username, password_hash FROM users WHERE username = ?',
+                'SELECT username, password_hash FROM users WHERE username = %s',
                 (username,)
             )
             user = cursor.fetchone()
-            conn.close()
+            cursor.close()
+            return_db_connection(conn)
 
         if user and verify_password(password, user[1]):
             # Generate JWT token
@@ -157,6 +225,7 @@ def login():
             return jsonify({'error': 'Invalid username or password'}), 401
 
     except Exception as e:
+        print(f"Login error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/api/logout', methods=['POST'])
@@ -181,11 +250,13 @@ def verify_token():
             return jsonify({'valid': False, 'error': 'Invalid or expired token'}), 401
 
     except Exception as e:
+        print(f"Token verification error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/api/user/profile', methods=['GET'])
 def get_profile():
     """Get user profile (protected route)"""
+    conn = None
     try:
         auth_header = request.headers.get('Authorization')
         if not auth_header or not auth_header.startswith('Bearer '):
@@ -199,26 +270,28 @@ def get_profile():
 
         # Get user profile from database
         with db_lock:
-            conn = sqlite3.connect('users.db')
+            conn = get_db_connection()
             cursor = conn.cursor()
 
             cursor.execute(
-                'SELECT username, email, created_at FROM users WHERE username = ?',
+                'SELECT username, email, created_at FROM users WHERE username = %s',
                 (username,)
             )
             user = cursor.fetchone()
-            conn.close()
+            cursor.close()
+            return_db_connection(conn)
 
         if user:
             return jsonify({
                 'username': user[0],
                 'email': user[1],
-                'created_at': user[2]
+                'created_at': user[2].isoformat() if user[2] else None
             }), 200
         else:
             return jsonify({'error': 'User not found'}), 404
 
     except Exception as e:
+        print(f"Profile error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/health', methods=['GET'])
@@ -243,7 +316,10 @@ def root():
     }), 200
 
 if __name__ == '__main__':
-    # Initialize database
+    # Initialize database connection pool
+    init_database_pool()
+
+    # Initialize database tables
     init_database()
 
     # Get port from environment variable (Render.com sets this)
