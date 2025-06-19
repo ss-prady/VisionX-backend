@@ -1,1 +1,0 @@
-postgresql://x_feed_database_user:A0TpV0doiIJm6kZjktJHY4sz4fDF4nUP@dpg-d1a72tje5dus73eaqoj0-a/x_feed_database
