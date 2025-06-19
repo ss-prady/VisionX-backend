@@ -252,6 +252,9 @@ def handle_database_operation(operation):
     retry_delay = 1
     
     for attempt in range(max_retries):
+        if db_pool is None:
+            logger.error("Database connection pool not initialized")
+            raise DatabaseError("Database connection pool not initialized")
         try:
             with db_lock:
                 with db_pool.connection() as conn:
