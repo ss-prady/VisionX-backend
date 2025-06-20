@@ -117,6 +117,20 @@ def init_database():
                             CREATE INDEX IF NOT EXISTS idx_feed_shares_shared ON feed_shares(shared_with_id);
                         """)
 
+                        # Inside init_database() after creating feed_shares table
+                        cursor.execute("""
+                            CREATE TABLE IF NOT EXISTS feed_fetches (
+                                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                                fetch_from_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                PRIMARY KEY (user_id, fetch_from_id)
+                            )
+                        """)
+                        cursor.execute("""
+                            CREATE INDEX IF NOT EXISTS idx_feed_fetches_user ON feed_fetches(user_id)
+                        """)
+
+
                         logger.info("Database tables and indexes created successfully")
 
                     except psycopg.Error as e:
@@ -734,11 +748,19 @@ def share_feed():
             raise AuthenticationError('Owner user not found')
 
         def insert_share(cursor):
+            # Insert into share list
             cursor.execute("""
                 INSERT INTO feed_shares (owner_id, shared_with_id)
                 VALUES (%s, %s)
                 ON CONFLICT DO NOTHING
             """, (owner[0], shared_with[0]))
+            
+            # Insert reciprocal into fetch list
+            cursor.execute("""
+                INSERT INTO feed_fetches (user_id, fetch_from_id)
+                VALUES (%s, %s)
+                ON CONFLICT DO NOTHING
+            """, (shared_with[0], owner[0]))
 
         handle_database_operation(insert_share)
         logger.info(f"Feed shared: {owner_username} -> {share_with_username}")
@@ -775,6 +797,28 @@ def shared_users():
         logger.error(f"Failed to load shared users: {e}")
         return jsonify({'error': 'Failed to load shared users'}), 500
 
+@app.route('/api/fetch-users', methods=['GET'])
+@require_auth
+def fetch_users():
+    try:
+        current_username = request.current_user
+
+        def get_fetch_users(cursor):
+            cursor.execute("""
+                SELECT u.username
+                FROM feed_fetches ff
+                JOIN users u ON ff.fetch_from_id = u.id
+                WHERE ff.user_id = (SELECT id FROM users WHERE username = %s)
+            """, (current_username,))
+            return [{'username': row[0]} for row in cursor.fetchall()]
+
+        users = handle_database_operation(get_fetch_users)
+        return jsonify(users), 200
+
+    except Exception as e:
+        logger.error(f"Failed to load fetch users: {e}")
+        return jsonify({'error': 'Failed to load fetch users'}), 500
+
 
 @app.route('/api/unshare-feed/<username>', methods=['DELETE'])
 @require_auth
@@ -795,10 +839,17 @@ def unshare_feed(username):
             raise ValidationError('User not found')
 
         def delete_share(cursor):
+            # Remove from share list
             cursor.execute("""
                 DELETE FROM feed_shares
                 WHERE owner_id = %s AND shared_with_id = %s
             """, (owner[0], shared_with[0]))
+            
+            # Remove reciprocal from fetch list
+            cursor.execute("""
+                DELETE FROM feed_fetches
+                WHERE user_id = %s AND fetch_from_id = %s
+            """, (shared_with[0], owner[0]))
 
         handle_database_operation(delete_share)
         logger.info(f"Feed access revoked: {owner_username} -> {target_username}")
