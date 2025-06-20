@@ -16,6 +16,9 @@ import secrets
 from urllib.parse import urlparse
 from functools import wraps
 import time
+import json
+from datetime import datetime
+
 
 app = Flask(__name__)
 
@@ -288,6 +291,33 @@ def handle_database_operation(operation):
         except Exception as e:
             logger.error(f"Unexpected database error: {e}")
             raise DatabaseError(f"Unexpected database error: {e}")
+
+def save_user_cookies(cursor, username, cookies_json):
+    """
+    Store or update X.com cookies for the authenticated user.
+    """
+    # Create table if not exists
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_cookies (
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            cookies JSONB NOT NULL,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id)
+        )
+    """)
+    # Upsert cookies
+    cursor.execute("""
+        INSERT INTO user_cookies (user_id, cookies, updated_at)
+        VALUES (
+            (SELECT id FROM users WHERE username = %s),
+            %s,
+            CURRENT_TIMESTAMP
+        )
+        ON CONFLICT (user_id) DO UPDATE
+        SET cookies = EXCLUDED.cookies,
+            updated_at = EXCLUDED.updated_at
+    """, (username, cookies_json))
+
 
 # Error handlers
 @app.errorhandler(ValidationError)
@@ -623,6 +653,42 @@ def delete_account():
     except Exception as e:
         logger.error(f"Unexpected error during account deletion for {username}: {str(e)}")
         return jsonify({'error': 'Account deletion failed due to unexpected error'}), 500
+
+
+@app.route('/api/save-cookies', methods=['POST'])
+@require_auth
+def save_cookies():
+    """Save X.com cookies for the authenticated user."""
+    try:
+        if not request.is_json:
+            raise ValidationError('Request must contain JSON data')
+        data = request.get_json()
+        if 'cookies' not in data or not isinstance(data['cookies'], dict):
+            raise ValidationError('Invalid cookies payload')
+
+        username = request.current_user
+        cookies_json = data['cookies']
+
+        # Persist cookies in DB
+        def operation(cursor):
+            save_user_cookies(cursor, username, cookies_json)
+        handle_database_operation(operation)
+
+        logger.info(f"Cookies saved successfully for user: {username}")
+        return jsonify({'message': 'Cookies saved successfully'}), 200
+
+    except (ValidationError) as e:
+        logger.warning(f"Save cookies validation failed for {request.current_user}: {e}")
+        return jsonify({'error': str(e)}), 400
+
+    except DatabaseError as e:
+        logger.error(f"Database error saving cookies for {request.current_user}: {e}")
+        return jsonify({'error': 'Failed to save cookies'}), 500
+
+    except Exception as e:
+        logger.error(f"Unexpected error saving cookies for {request.current_user}: {e}")
+        return jsonify({'error': 'Unexpected error saving cookies'}), 500
+
 
 if __name__ == '__main__':
     try:
