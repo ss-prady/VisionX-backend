@@ -43,3 +43,6 @@ email-validator
 
 # Monitoring and Logging (Optional)
 structlog
+
+#tweet fetching
+twikit

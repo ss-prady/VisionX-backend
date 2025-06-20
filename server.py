@@ -17,7 +17,11 @@ from urllib.parse import urlparse
 from functools import wraps
 import time
 import json
-from datetime import datetime
+import asyncio
+import json
+import tempfile
+from twikit import Client
+from concurrent.futures import ThreadPoolExecutor
 
 
 app = Flask(__name__)
@@ -28,6 +32,92 @@ CORS(app, supports_credentials=True)
 # Secret key for JWT tokens - in production, use environment variable
 SECRET_KEY = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 app.config['SECRET_KEY'] = SECRET_KEY
+
+# Thread pool for async operations
+tweet_executor = ThreadPoolExecutor(max_workers=5)
+
+class TweetFetcher:
+    def __init__(self):
+        self.active_fetches = {}  # Track ongoing fetches
+        self.fetch_lock = threading.Lock()
+    
+    async def fetch_tweets_for_user(self, cookies_dict, user_id, fetch_from_id):
+        """Fetch tweets using twikit with user-specific cookies"""
+        try:
+            client = Client()
+            
+            # Create temporary cookie file for this specific fetch
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
+                json.dump(cookies_dict, temp_file)
+                temp_cookie_path = temp_file.name
+            
+            try:
+                # Load cookies from temporary file
+                client.load_cookies(path=temp_cookie_path)
+                
+                tweet_data = []
+                tweets = await client.get_timeline(count=20)
+                
+                while tweets and len(tweet_data) < 100:
+                    for tweet in tweets:
+                        user = tweet.user
+                        media_urls = []
+                        
+                        # Handle media (same logic as main.py)
+                        if tweet.media:
+                            for media in tweet.media:
+                                if media.type == "photo":
+                                    url = getattr(media, "media_url_https", None) or getattr(media, "media_url", None)
+                                    if url:
+                                        media_urls.append(url)
+                                elif media.type in ("video", "animated_gif") and hasattr(media, "streams"):
+                                    streams = media.streams or []
+                                    if streams:
+                                        best = streams[-1]
+                                        if best.url:
+                                            media_urls.append(best.url)
+                        
+                        profile_image_url = getattr(user, "profile_image_url_https", None) or getattr(user, "profile_image_url", None)
+                        cleaned_text = re.sub(r"https://t\.co/\w+", "", tweet.full_text).strip()
+                        
+                        tweet_data.append({
+                            "username": tweet.user.screen_name,
+                            "name": tweet.user.name,
+                            "verified": tweet.user.is_blue_verified,
+                            "profile_image_url": profile_image_url,
+                            "text": cleaned_text,
+                            "tweet_id": getattr(tweet, "id", None),
+                            "created_at": str(tweet.created_at),
+                            "url": f"https://twitter.com/{tweet.user.screen_name}/status/{tweet.id}",
+                            "media": media_urls,
+                            "like_count": getattr(tweet, "favorite_count", 0),
+                            "retweet_count": getattr(tweet, "retweet_count", 0),
+                            "reply_count": getattr(tweet, "reply_count", 0),
+                            "views": getattr(tweet, "view_count", 0)
+                        })
+                        
+                        if len(tweet_data) >= 100:
+                            break
+                    
+                    if len(tweet_data) >= 100:
+                        break
+                    
+                    await asyncio.sleep(3)  # PAGE_FETCH_DELAY
+                    tweets = await tweets.next()
+                
+                return tweet_data
+                
+            finally:
+                # Clean up temporary cookie file
+                if os.path.exists(temp_cookie_path):
+                    os.unlink(temp_cookie_path)
+                    
+        except Exception as e:
+            logger.error(f"Error fetching tweets: {e}")
+            raise
+
+# Global tweet fetcher instance
+tweet_fetcher = TweetFetcher()
 
 # Database connection pool
 db_pool = None
@@ -130,6 +220,21 @@ def init_database():
                             CREATE INDEX IF NOT EXISTS idx_feed_fetches_user ON feed_fetches(user_id)
                         """)
 
+                        # Add this to your init_database() function
+                        cursor.execute("""
+                            CREATE TABLE IF NOT EXISTS user_tweets (
+                                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                                fetched_from_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                                tweets_data JSONB NOT NULL,
+                                fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                expires_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP + INTERVAL '1 hour'),
+                                PRIMARY KEY (user_id, fetched_from_id)
+                            )
+                        """)
+
+                        cursor.execute("""
+                            CREATE INDEX IF NOT EXISTS idx_user_tweets_expires ON user_tweets(expires_at);
+                        """)
 
                         logger.info("Database tables and indexes created successfully")
 
@@ -861,6 +966,160 @@ def unshare_feed(username):
         logger.error(f"Unshare feed error: {e}")
         return jsonify({'error': 'Revocation failed'}), 500
 
+@app.route('/api/fetch-feed/<username>', methods=['POST'])
+@require_auth
+def fetch_user_feed(username):
+    """Fetch tweets from a user's feed that has been shared with current user"""
+    try:
+        current_username = request.current_user
+        target_username = sanitize_input(username)
+        
+        if current_username == target_username:
+            raise ValidationError('Cannot fetch your own feed through this endpoint')
+        
+        # Verify access permissions and get user data
+        def verify_access_and_get_data(cursor):
+            # Check if current user has access to target user's feed
+            cursor.execute("""
+                SELECT ff.fetch_from_id, u1.username, u2.id as current_user_id
+                FROM feed_fetches ff
+                JOIN users u1 ON ff.fetch_from_id = u1.id
+                JOIN users u2 ON ff.user_id = u2.id
+                WHERE u2.username = %s AND u1.username = %s
+            """, (current_username, target_username))
+            
+            access_check = cursor.fetchone()
+            if not access_check:
+                raise ValidationError('You do not have access to this user\'s feed')
+            
+            fetch_from_id, target_user, current_user_id = access_check
+            
+            # Get target user's cookies
+            cursor.execute("""
+                SELECT cookies FROM user_cookies WHERE user_id = %s
+            """, (fetch_from_id,))
+            
+            cookies_row = cursor.fetchone()
+            if not cookies_row:
+                raise ValidationError('Target user has not saved their cookies yet')
+            
+            return {
+                'fetch_from_id': fetch_from_id,
+                'current_user_id': current_user_id,
+                'cookies': json.loads(cookies_row[0]),
+                'target_username': target_user
+            }
+        
+        user_data = handle_database_operation(verify_access_and_get_data)
+        
+        # Check if we have recent cached data
+        def check_cached_tweets(cursor):
+            cursor.execute("""
+                SELECT tweets_data, fetched_at 
+                FROM user_tweets 
+                WHERE user_id = %s AND fetched_from_id = %s 
+                AND expires_at > CURRENT_TIMESTAMP
+            """, (user_data['current_user_id'], user_data['fetch_from_id']))
+            return cursor.fetchone()
+        
+        cached_data = handle_database_operation(check_cached_tweets)
+        
+        if cached_data:
+            logger.info(f"Returning cached tweets for {current_username} from {target_username}")
+            return jsonify({
+                'tweets': json.loads(cached_data[0]),
+                'fetched_at': cached_data[1].isoformat(),
+                'cached': True,
+                'source_user': target_username
+            }), 200
+        
+        # Create unique fetch identifier
+        fetch_key = f"{user_data['current_user_id']}_{user_data['fetch_from_id']}"
+        
+        # Check if fetch is already in progress
+        with tweet_fetcher.fetch_lock:
+            if fetch_key in tweet_fetcher.active_fetches:
+                return jsonify({
+                    'message': 'Feed fetch already in progress',
+                    'status': 'processing'
+                }), 202
+            
+            tweet_fetcher.active_fetches[fetch_key] = True
+        
+        try:
+            # Fetch tweets asynchronously
+            def run_async_fetch():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    return loop.run_until_complete(
+                        tweet_fetcher.fetch_tweets_for_user(
+                            user_data['cookies'], 
+                            user_data['current_user_id'],
+                            user_data['fetch_from_id']
+                        )
+                    )
+                finally:
+                    loop.close()
+            
+            # Run in thread pool to avoid blocking
+            future = tweet_executor.submit(run_async_fetch)
+            tweets_data = future.result(timeout=300)  # 5 minute timeout
+            
+            # Store in database
+            def store_tweets(cursor):
+                cursor.execute("""
+                    INSERT INTO user_tweets (user_id, fetched_from_id, tweets_data, expires_at)
+                    VALUES (%s, %s, %s, CURRENT_TIMESTAMP + INTERVAL '1 hour')
+                    ON CONFLICT (user_id, fetched_from_id) 
+                    DO UPDATE SET 
+                        tweets_data = EXCLUDED.tweets_data,
+                        fetched_at = CURRENT_TIMESTAMP,
+                        expires_at = EXCLUDED.expires_at
+                """, (user_data['current_user_id'], user_data['fetch_from_id'], json.dumps(tweets_data)))
+            
+            handle_database_operation(store_tweets)
+            
+            logger.info(f"Successfully fetched {len(tweets_data)} tweets for {current_username} from {target_username}")
+            
+            return jsonify({
+                'tweets': tweets_data,
+                'fetched_at': datetime.utcnow().isoformat(),
+                'cached': False,
+                'source_user': target_username,
+                'count': len(tweets_data)
+            }), 200
+            
+        finally:
+            # Remove from active fetches
+            with tweet_fetcher.fetch_lock:
+                tweet_fetcher.active_fetches.pop(fetch_key, None)
+    
+    except ValidationError as e:
+        return handle_validation_error(e)
+    except Exception as e:
+        logger.error(f"Feed fetch error for {current_username} from {target_username}: {e}")
+        return jsonify({'error': 'Feed fetch failed'}), 500
+
+@app.route('/api/cleanup-expired-tweets', methods=['POST'])
+def cleanup_expired_tweets():
+    """Clean up expired tweet data - can be called by a cron job"""
+    try:
+        def cleanup_operation(cursor):
+            cursor.execute("DELETE FROM user_tweets WHERE expires_at < CURRENT_TIMESTAMP")
+            return cursor.rowcount
+        
+        deleted_count = handle_database_operation(cleanup_operation)
+        
+        logger.info(f"Cleaned up {deleted_count} expired tweet records")
+        return jsonify({
+            'message': f'Cleaned up {deleted_count} expired records',
+            'timestamp': datetime.utcnow().isoformat()
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
+        return jsonify({'error': 'Cleanup failed'}), 500
 
 if __name__ == '__main__':
     try:
