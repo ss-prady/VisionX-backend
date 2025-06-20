@@ -1006,7 +1006,7 @@ def fetch_user_feed(username):
             return {
                 'fetch_from_id': fetch_from_id,
                 'current_user_id': current_user_id,
-                'cookies': json.loads(cookies_row[0]),
+                'cookies': cookies_row[0],
                 'target_username': target_user
             }
         
