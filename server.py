@@ -1027,7 +1027,7 @@ def fetch_user_feed(username):
         if cached_data:
             logger.info(f"Returning cached tweets for {current_username} from {target_username}")
             return jsonify({
-                'tweets': json.loads(cached_data[0]),
+                'tweets': cached_data[0],
                 'fetched_at': cached_data[1].isoformat(),
                 'cached': True,
                 'source_user': target_username
