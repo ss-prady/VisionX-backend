@@ -293,9 +293,8 @@ def handle_database_operation(operation):
             raise DatabaseError(f"Unexpected database error: {e}")
 
 def save_user_cookies(cursor, username, cookies_json):
-    """
-    Store or update X.com cookies for the authenticated user.
-    """
+    # Convert the dictionary to a JSON string
+    cookies_json_str = json.dumps(cookies_json)
     # Create table if not exists
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS user_cookies (
@@ -316,7 +315,7 @@ def save_user_cookies(cursor, username, cookies_json):
         ON CONFLICT (user_id) DO UPDATE
         SET cookies = EXCLUDED.cookies,
             updated_at = EXCLUDED.updated_at
-    """, (username, cookies_json))
+    """, (username, cookies_json_str))
 
 
 # Error handlers
