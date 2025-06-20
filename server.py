@@ -103,6 +103,20 @@ def init_database():
                             CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
                         """)
 
+                        cursor.execute("""
+                            CREATE TABLE IF NOT EXISTS feed_shares (
+                                owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                                shared_with_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                PRIMARY KEY (owner_id, shared_with_id)
+                            )
+                        """)
+                        
+                        # Create index for shared_with lookups
+                        cursor.execute("""
+                            CREATE INDEX IF NOT EXISTS idx_feed_shares_shared ON feed_shares(shared_with_id);
+                        """)
+
                         logger.info("Database tables and indexes created successfully")
 
                     except psycopg.Error as e:
@@ -687,6 +701,114 @@ def save_cookies():
     except Exception as e:
         logger.error(f"Unexpected error saving cookies for {request.current_user}: {e}")
         return jsonify({'error': 'Unexpected error saving cookies'}), 500
+
+
+@app.route('/api/share-feed', methods=['POST'])
+@require_auth
+def share_feed():
+    try:
+        if not request.is_json:
+            raise ValidationError('Request must contain JSON data')
+        data = request.get_json()
+        if 'share_with' not in data:
+            raise ValidationError('Missing "share_with" username')
+
+        owner_username = request.current_user
+        share_with_username = sanitize_input(data['share_with'])
+
+        if owner_username == share_with_username:
+            raise ValidationError('Cannot share feed with yourself')
+
+        # Validate target user exists and is active
+        def get_user_ids(cursor):
+            cursor.execute('SELECT id FROM users WHERE username = %s AND is_active = TRUE', (owner_username,))
+            owner = cursor.fetchone()
+            cursor.execute('SELECT id FROM users WHERE username = %s AND is_active = TRUE', (share_with_username,))
+            shared_with = cursor.fetchone()
+            return owner, shared_with
+
+        owner, shared_with = handle_database_operation(get_user_ids)
+        if not shared_with:
+            raise ValidationError('Target user does not exist or is inactive')
+        if not owner:
+            raise AuthenticationError('Owner user not found')
+
+        def insert_share(cursor):
+            cursor.execute("""
+                INSERT INTO feed_shares (owner_id, shared_with_id)
+                VALUES (%s, %s)
+                ON CONFLICT DO NOTHING
+            """, (owner[0], shared_with[0]))
+
+        handle_database_operation(insert_share)
+        logger.info(f"Feed shared: {owner_username} -> {share_with_username}")
+        return jsonify({'message': f'Feed shared with {share_with_username}!'}), 200
+
+    except (ValidationError, AuthenticationError) as e:
+        return handle_validation_error(e)
+    except psycopg.IntegrityError:
+        return jsonify({'error': 'Feed already shared with this user'}), 409
+    except Exception as e:
+        logger.error(f"Share feed error: {e}")
+        return jsonify({'error': 'Sharing failed'}), 500
+
+
+@app.route('/api/shared-users', methods=['GET'])
+@require_auth
+def shared_users():
+    try:
+        owner_username = request.current_user
+
+        def get_shared_users(cursor):
+            cursor.execute("""
+                SELECT u.username
+                FROM feed_shares fs
+                JOIN users u ON fs.shared_with_id = u.id
+                WHERE fs.owner_id = (SELECT id FROM users WHERE username = %s)
+            """, (owner_username,))
+            return [{'username': row[0]} for row in cursor.fetchall()]
+
+        users = handle_database_operation(get_shared_users)
+        return jsonify(users), 200
+
+    except Exception as e:
+        logger.error(f"Failed to load shared users: {e}")
+        return jsonify({'error': 'Failed to load shared users'}), 500
+
+
+@app.route('/api/unshare-feed/<username>', methods=['DELETE'])
+@require_auth
+def unshare_feed(username):
+    try:
+        owner_username = request.current_user
+        target_username = sanitize_input(username)
+
+        def get_user_ids(cursor):
+            cursor.execute('SELECT id FROM users WHERE username = %s', (owner_username,))
+            owner = cursor.fetchone()
+            cursor.execute('SELECT id FROM users WHERE username = %s', (target_username,))
+            shared_with = cursor.fetchone()
+            return owner, shared_with
+
+        owner, shared_with = handle_database_operation(get_user_ids)
+        if not owner or not shared_with:
+            raise ValidationError('User not found')
+
+        def delete_share(cursor):
+            cursor.execute("""
+                DELETE FROM feed_shares
+                WHERE owner_id = %s AND shared_with_id = %s
+            """, (owner[0], shared_with[0]))
+
+        handle_database_operation(delete_share)
+        logger.info(f"Feed access revoked: {owner_username} -> {target_username}")
+        return jsonify({'message': f'Access revoked from {target_username}'}), 200
+
+    except (ValidationError, AuthenticationError) as e:
+        return handle_validation_error(e)
+    except Exception as e:
+        logger.error(f"Unshare feed error: {e}")
+        return jsonify({'error': 'Revocation failed'}), 500
 
 
 if __name__ == '__main__':
